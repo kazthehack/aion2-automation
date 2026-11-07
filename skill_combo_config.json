@@ -1,0 +1,38 @@
+{
+  "SKILL_COOLDOWNS": {},
+  "COMBO_SETS": [
+    {
+      "name": "Basic DPS Rotation",
+      "skills": [
+        "r",
+        "t",
+        "1",
+        "2"
+      ],
+      "cooldown": 0.0,
+      "delay_between_skills": 0.1,
+      "enabled": true
+    }
+  ],
+  "DELAY_RANDOMIZATION": 0.15,
+  "SKILL_COMBO_ENABLED": true,
+  "PRE_MACRO_FOCUS_ENABLED": false,
+  "PRE_MACRO_FOCUS_DELAY": 0.25,
+  "INPUT_BACKEND": "interception",
+  "INPUT_DRY_RUN": false,
+  "COMBO_PRIORITY": null,
+  "STEALTH_ATTACK_MODE_ENABLED": true,
+  "ATTACK_MODE_WEIGHTS": {
+    "standard_attack": 0.0,
+    "single_skill": 0.0,
+    "combo_set": 1.0
+  },
+  "SINGLE_SKILL_POOL": [],
+  "SINGLE_SKILL_GLOBAL_COOLDOWN": 0.1,
+  "COMBAT_USE_SKILLS": true,
+  "AUTO_LOOT": true,
+  "SENTRY_MODE": true,
+  "FARMING_MODE": false,
+  "LANGUAGE": "en",
+  "SKIP_PRESTART_CHECKLIST": true
+}

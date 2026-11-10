@@ -251,6 +251,7 @@ def _translate_key(key: str) -> str:
 # Minimal virtual-key map used for scancode mapping. Keep only keys the app uses.
 _USER32 = ctypes.windll.user32
 VK_MAP = {
+    'esc': 0x1B,
     'tab': 0x09,
     'r': 0x52,
     't': 0x54,

@@ -91,6 +91,13 @@ class ActionPlanner:
         self._sentry_rotation_thread = None
         self._sentry_rotation_stop = threading.Event()
         self._sentry_rotation_pause = 0.5
+        self._sentry_rejected_target = False
+        self._sentry_reacquire_pause = 1.5
+        self._sentry_attack_resume_at = 0.0
+        self._sentry_selection_requested_at = float('-inf')
+        self._sentry_distance_wait_since = None
+        self._sentry_distance_timeout = 1.0
+        self._sentry_distance_max_age = 0.5
         self._search_stop = threading.Event()
         self._target_confirm_wait = 0.8
         self._post_tab_attack_wait = 1.5
@@ -159,16 +166,78 @@ class ActionPlanner:
                 return
             if index:
                 ic.execution_wait(self._attack_key_gap)
+            if not self._sentry_attack_allowed():
+                return
             if require_visible_monster and not self._visible_monsters():
                 return
             ic.tap_key(key)
         self._last_attack = time.time()
+
+    def _sentry_attack_allowed(self):
+        """Pure combat gate: selection and cancellation never authorize an attack."""
+        if not getattr(skill_combo_config, 'SENTRY_MODE', False):
+            return True
+        distance = self._sentry_distance()
+        return (not self._sentry_rejected_target
+                and time.monotonic() >= self._sentry_attack_resume_at
+                and self._has_selected_target()
+                and distance is not None and distance <= 15)
+
+    def _sentry_distance(self):
+        observation = self._target_hud
+        stamp = observation.get('distance_observed_at', observation['observed_at'])
+        if (not observation['visible'] or stamp is None
+                or stamp < self._sentry_selection_requested_at
+                or time.monotonic() - stamp > self._sentry_distance_max_age):
+            return None
+        return observation['distance_m']
+
+    def _sentry_manage_target(self):
+        """Run on the planner tick only after combat has finished releasing input."""
+        if (not self.enabled or not getattr(skill_combo_config, 'SENTRY_MODE', False)
+                or getattr(skill_combo_config, 'FARMING_MODE', False)):
+            return False
+        if self._sentry_rejected_target:
+            return False
+        if time.monotonic() < self._sentry_attack_resume_at:
+            return False
+        if not self._has_selected_target():
+            self._sentry_distance_wait_since = None
+            now = time.monotonic()
+            if now - self._sentry_selection_requested_at >= 1.5:
+                # Selecting with an attack can start game auto-approach before OCR.
+                ic.tap_key('tab')
+                self._sentry_selection_requested_at = now
+            return False
+        now = time.monotonic()
+        distance = self._sentry_distance()
+        if distance is None:
+            if self._sentry_distance_wait_since is None:
+                self._sentry_distance_wait_since = now
+            if now - self._sentry_distance_wait_since < self._sentry_distance_timeout:
+                return False
+            reason = 'distance unreadable or stale'
+        else:
+            self._sentry_distance_wait_since = None
+            if distance <= 15:
+                return True
+            reason = f'{distance:g} m (limit 15 m)'
+        if not getattr(skill_combo_config, 'SENTRY_MODE', False):
+            return False
+        ic.tap_key('esc')
+        self._sentry_rejected_target = True
+        logger.info(f'ActionPlanner: sentry cleared target: {reason}')
+        return False
+
+    def _sentry_target_locked(self):
+        return self._has_selected_target() and not self._sentry_rejected_target
 
     def _start_combat_worker(self):
         """Never overlap workers, including when a stopped target is reacquired."""
         if self._combat_thread is not None and self._combat_thread.is_alive():
             return False
         if (not self.enabled
+                or not self._sentry_attack_allowed()
                 or (not self._has_selected_target() and not getattr(skill_combo_config, 'SENTRY_MODE', False))
                 or getattr(skill_combo_config, 'FARMING_MODE', False)):
             return False
@@ -234,17 +303,20 @@ class ActionPlanner:
             self._send_basic_attack()
             while not stop_event.is_set():
                 ic.check_cancelled()
-                if not self.enabled or getattr(skill_combo_config, 'FARMING_MODE', False):
+                if (not self.enabled or getattr(skill_combo_config, 'FARMING_MODE', False)
+                        or not self._sentry_attack_allowed()):
                     break
                 self._send_basic_attack()
                 manager = self.skill_combo_manager
                 if (manager is not None
+                        and self._sentry_attack_allowed()
                         and getattr(skill_combo_config, 'SKILL_COMBO_ENABLED', True)
                         and getattr(skill_combo_config, 'COMBAT_USE_SKILLS', True)):
                     ic.check_cancelled()
                     if manager.has_ready_combo() or manager.has_available_single_skill():
                         ic.execution_wait(self._attack_repeat_gap)
-                        manager.try_stealth_attack(True)
+                        if self._sentry_attack_allowed():
+                            manager.try_stealth_attack(True)
                 ic.execution_wait(self._attack_repeat_gap)
         except Exception as exc:
             if not stop_event.is_set() and not getattr(self, 'cancel_event', stop_event).is_set():
@@ -288,9 +360,16 @@ class ActionPlanner:
             self._current_target = None
 
     def set_sentry_mode(self, enabled: bool):
+        self._sentry_rejected_target = False
+        self._sentry_attack_resume_at = 0.0
+        self._sentry_selection_requested_at = float('-inf')
+        self._sentry_distance_wait_since = None
         if not enabled:
             self._stop_combat_worker()
             self._sentry_rotation_stop.set()
+            self._mode = 'scanning'
+            self._current_target = None
+            self._approach_expired.clear()
         if enabled or getattr(skill_combo_config, 'FARMING_MODE', False):
             self._roam_cancel_event.set()
             self._stop_search_worker()
@@ -333,8 +412,14 @@ class ActionPlanner:
             return
         self._stop_search_worker()
         self._stop_approach_worker()
-        self._start_combat_worker()
-        if self._has_selected_target():
+        if self._sentry_attack_allowed():
+            self._start_combat_worker()
+        else:
+            self._stop_combat_worker()
+            if self._combat_thread is not None and self._combat_thread.is_alive():
+                return  # Do not interleave Escape/Tab with a finishing attack.
+            self._sentry_manage_target()
+        if self._sentry_target_locked():
             self._sentry_rotation_stop.set()
             return
         if self._sentry_rotation_thread is None or not self._sentry_rotation_thread.is_alive():
@@ -354,7 +439,7 @@ class ActionPlanner:
                 ic.execution_wait(0.02)
             while (self.enabled and getattr(skill_combo_config, 'SENTRY_MODE', False)
                    and not getattr(skill_combo_config, 'FARMING_MODE', False)
-                   and not self._has_selected_target()):
+                   and not self._sentry_target_locked()):
                 ic.check_cancelled()
                 ic.focus_window(self.hwnd)
                 ic.hold_mouse_down('right')
@@ -364,7 +449,7 @@ class ActionPlanner:
                     ic.check_cancelled()
                     if (not self.enabled or not getattr(skill_combo_config, 'SENTRY_MODE', False)
                             or getattr(skill_combo_config, 'FARMING_MODE', False)
-                            or self._has_selected_target()):
+                            or self._sentry_target_locked()):
                         return
                     ic.move_mouse_relative(random.randint(*self._roam_turn_step), 0,
                                            steps=1, duration=duration * 0.7)
@@ -409,8 +494,20 @@ class ActionPlanner:
         if observation['observed_at'] < self._target_hud['observed_at']:
             return
         self._target_hud = observation
+        if (getattr(skill_combo_config, 'SENTRY_MODE', False)
+                and self._sentry_rejected_target):
+            if observation['visible']:
+                return  # The rejected HUD may linger after Escape; keep searching.
+            self._sentry_rejected_target = False
+            # Allow search rotation to turn away before an attack auto-targets again.
+            self._sentry_attack_resume_at = time.monotonic() + self._sentry_reacquire_pause
+            self._selected_target.clear()
+            self._detected_target_health = False
         self._record_target_presence(observation['visible'] or self._detected_target_health,
                                      observation['observed_at'])
+        if (getattr(skill_combo_config, 'SENTRY_MODE', False)
+                and not self._sentry_attack_allowed()):
+            self._stop_combat_worker()
         self._hud_initialized.set()
         if observation['visible']:
             self._roam_cancel_event.set()

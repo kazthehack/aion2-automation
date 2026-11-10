@@ -720,7 +720,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sentry_mode_cb = QtWidgets.QCheckBox()
         self._register_translatable(self.sentry_mode_cb.setText, 'checkbox_sentry_mode')
         self.sentry_mode_cb.setText(self.tr('checkbox_sentry_mode'))
-        self.sentry_mode_cb.setToolTip('Attack in place; rotate only when no target is selected. No walking or Tab targeting.')
+        self.sentry_mode_cb.setToolTip('Select with Tab; attack only with a fresh distance of 15 m or less. Clear distant or unreadable targets and rotate to search. No movement keys.')
         self.sentry_mode_cb.setChecked(skill_combo_config.SENTRY_MODE)
         self.sentry_mode_cb.toggled.connect(self._update_sentry_mode)
         self.page_dashboard_layout.addWidget(self.sentry_mode_cb)

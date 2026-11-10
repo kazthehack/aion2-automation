@@ -1,6 +1,7 @@
 ﻿"""Detection controller: ties capture, workflow client, and overlay together."""
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 from loguru import logger
 from capture import CaptureWorker
@@ -109,6 +110,7 @@ class DetectionController:
     def start(self):
         # Start without extra startup delay (stealth removed)
         self.log("Starting capture and detection")
+        self.log(f'Automation source: {Path(__file__).resolve().parent}')
         self.capture.start_capture()
         self.hud_reader.start()
         self._running.set()

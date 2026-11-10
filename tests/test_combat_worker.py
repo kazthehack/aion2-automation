@@ -112,6 +112,9 @@ class CombatWorkerTests(unittest.TestCase):
     def wait_for(self, condition):
         deadline = time.monotonic() + 1
         while not condition() and time.monotonic() < deadline:
+            if (self.cfg.SENTRY_MODE and self.planner.enabled
+                    and not self.planner.cancel_event.is_set()):
+                self.planner.sentry_tick()  # Model the production planner's periodic ticks.
             time.sleep(0.002)
         self.assertTrue(condition())
 
@@ -294,7 +297,7 @@ class CombatWorkerTests(unittest.TestCase):
         self.scan([self.monster])
         self.assertIsNone(self.planner._search_thread)
         self.wait_for(lambda: bool(self.ic.rotations))
-        self.hud(25, (100, 200))
+        self.hud(15, (100, 200))
         self.scan()
         self.wait_for(lambda: not self.planner._sentry_rotation_thread.is_alive())
         turns = len(self.ic.rotations)
@@ -302,15 +305,69 @@ class CombatWorkerTests(unittest.TestCase):
         self.assertEqual(self.ic.movement, [])
         self.planner.sentry_tick()
         self.assertEqual(len(self.ic.rotations), turns)
-        self.assertNotIn('tab', [k for k, _ in self.ic.keys])
+        keys = [k for k, _ in self.ic.keys]
+        self.assertLessEqual(keys.count('tab'), 1)
 
     def test_sentry_with_existing_target_never_starts_rotation(self):
         self.cfg.SENTRY_MODE = True
-        self.hud(19)
+        self.hud(15)
         self.planner.sentry_tick()
         self.wait_for(lambda: len(self.ic.keys) >= 4)
         self.assertIsNone(self.planner._sentry_rotation_thread)
         self.assertEqual(self.ic.rotations, [])
+
+    def test_sentry_cannot_spawn_combat_without_in_range_ocr(self):
+        self.cfg.SENTRY_MODE = True
+        for distance in (None, 15.1, 30):
+            with self.subTest(distance=distance):
+                self.hud(distance)
+                self.assertFalse(self.planner._start_combat_worker())
+                self.assertIsNone(self.planner._combat_thread)
+                self.assertEqual(self.ic.keys, [])
+
+    def test_non_sentry_ignores_rejected_target_state_and_approaches_far_target(self):
+        self.planner._sentry_rejected_target = True
+        self.planner._sentry_attack_resume_at = time.monotonic() + 100
+        self.hud(30, (100, 200))
+        self.assertTrue(self.planner._has_selected_target())
+        self.assertEqual(self.planner._target_marker_position(), (100, 200))
+        self.planner._sentry_manage_target()
+        self.scan()
+        self.wait_for(lambda: ('down', 'w') in self.ic.movement)
+        self.wait_for(lambda: ('down', 'a') in self.ic.movement)
+        self.assertEqual(self.planner._mode, 'approaching')
+        self.assertNotIn('esc', [k for k, _ in self.ic.keys])
+
+    def test_disabling_sentry_restores_normal_far_target_approach(self):
+        self.cfg.SENTRY_MODE = True
+        self.planner._mode = 'combat'
+        self.planner._approach_expired.set()
+        self.hud(30, (100, 200))
+        self.planner.sentry_tick()
+        self.assertTrue(self.planner._sentry_rejected_target)
+        self.cfg.SENTRY_MODE = False
+        self.planner.set_sentry_mode(False)
+        self.assertEqual(self.planner._mode, 'scanning')
+        self.assertFalse(self.planner._approach_expired.is_set())
+        count = len(self.ic.keys)
+        self.hud(30, (100, 200))
+        self.scan()
+        self.wait_for(lambda: ('down', 'w') in self.ic.movement)
+        self.assertNotIn('esc', [k for k, _ in self.ic.keys[count:]])
+
+    def test_sentry_stops_running_combat_as_soon_as_ocr_is_unknown(self):
+        self.cfg.SENTRY_MODE = True
+        self.hud(15)
+        self.planner.sentry_tick()
+        self.wait_for(lambda: len(self.ic.keys) >= 4)
+        worker = self.planner._combat_thread
+        self.hud(None)
+        self.assertTrue(self.planner._combat_stop.is_set())
+        self.wait_for(lambda: not worker.is_alive())
+        count = len(self.ic.keys)
+        self.planner.sentry_tick()
+        time.sleep(0.03)
+        self.assertEqual(len(self.ic.keys), count)
 
     def test_new_visual_frame_cannot_refresh_stale_distance_or_start_search(self):
         self.planner.update_target_hud(dict(visible=True, hp_visible=True, distance_m=22,
@@ -323,7 +380,7 @@ class CombatWorkerTests(unittest.TestCase):
 
     def test_sentry_resumes_rotation_after_confirmed_target_loss(self):
         self.cfg.SENTRY_MODE = True
-        self.hud(19)
+        self.hud(15)
         self.planner.sentry_tick()
         combat = self.planner._combat_thread
         self.wait_for(lambda: len(self.ic.keys) >= 4)
@@ -331,29 +388,109 @@ class CombatWorkerTests(unittest.TestCase):
         self.planner.sentry_tick()
         self.wait_for(lambda: bool(self.ic.rotations))
         self.assertIs(self.planner._combat_thread, combat)
+        self.wait_for(lambda: not combat.is_alive())
         self.assertEqual(self.ic.movement, [])
 
-    def test_sentry_attacks_without_monsters_target_hud_or_completed_hud_scan(self):
+    def test_sentry_rejects_far_target_once_and_rotates_until_hud_clears(self):
+        self.cfg.SENTRY_MODE = True
+        self.planner._sentry_reacquire_pause = 0.15
+        self.planner._sentry_rotation_pause = 0.001
+        self.hud(16)
+        self.planner.sentry_tick()
+        self.wait_for(lambda: self.planner._sentry_rejected_target)
+        self.planner.sentry_tick()
+        self.wait_for(lambda: (self.planner.sentry_tick(), bool(self.ic.rotations))[1])
+        self.hud(16)  # Lingering HUD must not restore the rejected lock.
+        time.sleep(0.03)
+        self.assertEqual([k for k, _ in self.ic.keys], ['esc'])
+        self.assertEqual(self.ic.movement, [])
+        self.lose_target()
+        self.assertGreater(self.planner._sentry_attack_resume_at, time.monotonic())
+        turns = len(self.ic.rotations)
+        self.planner.sentry_tick()
+        self.wait_for(lambda: len(self.ic.rotations) > turns)
+        self.assertEqual([k for k, _ in self.ic.keys], ['esc'])
+        self.wait_for(lambda: any(k == 'tab' for k, _ in self.ic.keys))
+        self.assertEqual([k for k, _ in self.ic.keys], ['esc', 'tab'])
+
+    def test_sentry_waits_for_fresh_distance_before_attacking(self):
+        self.cfg.SENTRY_MODE = True
+        self.planner.update_target_hud(dict(visible=True, hp_visible=True,
+            distance_m=10, observed_at=time.monotonic(),
+            distance_observed_at=time.monotonic() - 20))
+        self.planner.sentry_tick()
+        time.sleep(0.03)
+        self.assertEqual(self.ic.keys, [])
+        self.hud(15)
+        self.wait_for(lambda: len(self.ic.keys) >= 4)
+        self.assertNotIn('esc', [k for k, _ in self.ic.keys])
+
+    def test_sentry_selects_without_attacking_until_distance_is_confirmed(self):
         self.cfg.SENTRY_MODE = True
         self.planner._hud_initialized.clear()
         self.planner.set_sentry_mode(True)
         self.planner.sentry_tick()
         worker = self.planner._combat_thread
-        self.wait_for(lambda: len(self.ic.keys) >= 8)
+        self.assertIsNone(worker)
+        self.wait_for(lambda: bool(self.ic.keys))
         self.planner.sentry_tick()
         self.assertIs(self.planner._combat_thread, worker)
-        self.assertEqual([key for key, _ in self.ic.keys[:8]], ['r', 't', '1', '2'] * 2)
+        time.sleep(0.03)
+        self.assertEqual([key for key, _ in self.ic.keys], ['tab'])
+        self.hud(None)
+        time.sleep(0.03)
+        self.assertEqual([key for key, _ in self.ic.keys], ['tab'])
+        self.assertIsNone(self.planner._combat_thread)
+        self.hud(15)
+        self.wait_for(lambda: len(self.ic.keys) >= 5)
+        self.assertIsNotNone(self.planner._combat_thread)
+        self.assertEqual([key for key, _ in self.ic.keys[:5]], ['tab', 'r', 't', '1', '2'])
         self.assertEqual(self.ic.movement, [])
-        self.wait_for(lambda: bool(self.ic.rotations))
         self.assertIsNone(self.planner._search_thread)
+
+    def test_sentry_cannot_use_distance_captured_before_tab(self):
+        self.cfg.SENTRY_MODE = True
+        self.planner.sentry_tick()
+        self.wait_for(lambda: self.planner._sentry_selection_requested_at > 0)
+        self.planner.update_target_hud(dict(visible=True, hp_visible=True,
+            distance_m=10, observed_at=time.monotonic(),
+            distance_observed_at=self.planner._sentry_selection_requested_at - 0.01))
+        time.sleep(0.03)
+        self.assertEqual([k for k, _ in self.ic.keys], ['tab'])
+        self.hud(20)
+        self.wait_for(lambda: self.planner._sentry_rejected_target)
+        self.assertEqual([k for k, _ in self.ic.keys], ['tab', 'esc'])
+
+    def test_sentry_clears_unreadable_target_without_attacking(self):
+        self.cfg.SENTRY_MODE = True
+        self.planner._sentry_distance_timeout = 0.03
+        self.hud(None)
+        self.planner.sentry_tick()
+        self.wait_for(lambda: self.planner._sentry_rejected_target)
+        self.assertEqual([k for k, _ in self.ic.keys], ['esc'])
+
+    def test_sentry_new_far_reading_interrupts_remaining_attack_keys(self):
+        self.cfg.SENTRY_MODE = True
+        self.hud(15)
+        original_tap = self.ic.tap_key
+        def tap_and_update(key):
+            original_tap(key)
+            if key == 'r':
+                self.hud(16)
+        self.ic.tap_key = tap_and_update
+        self.planner._send_basic_attack()
+        self.assertEqual([k for k, _ in self.ic.keys], ['r'])
+        self.planner.sentry_tick()
+        self.assertEqual([k for k, _ in self.ic.keys], ['r', 'esc'])
+        self.assertTrue(self.planner._sentry_rejected_target)
 
     def test_farming_still_overrides_sentry_and_stop_cancels_it(self):
         self.cfg.SENTRY_MODE = True
         self.planner.sentry_tick()
-        self.wait_for(lambda: len(self.ic.keys) >= 4)
+        self.wait_for(lambda: bool(self.ic.keys))
         self.cfg.FARMING_MODE = True
         self.planner.set_farming_mode(True)
-        self.wait_for(lambda: not self.planner._combat_thread.is_alive())
+        self.wait_for(lambda: self.planner._combat_thread is None or not self.planner._combat_thread.is_alive())
         self.wait_for(lambda: not self.planner._sentry_rotation_thread.is_alive())
         count = len(self.ic.keys)
         self.planner.sentry_tick()
